@@ -1,0 +1,406 @@
+---
+title: "Capstone Code"
+output: 
+  html_document:
+    toc: true  
+    theme: united  
+    fig_caption: true  
+    highlight: tango  
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, message=FALSE, warning=FALSE}
+# Libraries
+
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(tidyverse, skimr, GGally, plotly, viridis, 
+               caret, DT, data.table, lightgbm, readr, e1071, 
+               ranger, parallel, mice, corrplot, ggplot2, forecast, lubricate)
+
+#Data
+data <- read.csv("FACT_MARKET_DEMAND.csv")
+
+
+```
+
+
+# Geographical data
+
+```{r}
+market_data <- read_csv("zip_to_market_unit_mapping.csv")
+consumer_demographics <- read_csv("demo_data.csv")
+
+```
+
+## join market key
+```{r}
+# Load necessary libraries
+library(dplyr)
+
+# Renaming the ZIP_CODE column in zip_to_market to match the Zip column in demo_data
+market_data <- rename(market_data, Zip = ZIP_CODE)
+
+# Join the datasets based on Zip code
+joined_data <- left_join(consumer_demographics, market_data, by = "Zip")
+
+# View the first few rows of the joined dataset
+head(joined_data)
+
+
+```
+
+## Adding regions to joined_data
+
+```{r}
+# Define the mappings of state abbreviations to regions
+northern_states <- c("ME", "NH", "VT", "MA", "RI", "CT", "NY", "NJ", "PA", 
+                     "OH", "MI", "IN", "WI", "IL", "MN", "IA", "MO", "ND", 
+                     "SD", "NE", "KS")
+southern_states <- c("MD", "DE", "WV", "VA", "KY", "NC", "SC", "TN", "GA", 
+                     "AL", "MS", "AR", "LA", "FL", "TX", "OK")
+
+southwest_states <- c("AZ", "NM", "NV")
+
+# Function to determine the region based on state abbreviation
+get_region <- function(state_abbr) {
+  if (state_abbr %in% northern_states) {
+    return("Northern")
+  } else if (state_abbr %in% southern_states) {
+    return("Southern")
+  } else if (state_abbr %in% southwest_states) {
+    return("Southwest")
+  } else {
+    return("Western") # Defaulting to Western for states not included in the other lists
+  }
+}
+
+# Apply the function to the demo_data to create a new 'Region' column
+joined_data$Region <- sapply(joined_data$State, get_region) 
+
+# Check the first few rows to verify
+summary(joined_data)
+
+joined_data |> 
+  group_by(Region) |>
+  summarize(Count = sum(Count))
+
+
+```
+
+Western had the highest number of people, followed by the Southwest, then Northern region. 
+
+## Adding region to dataset
+
+```{r}
+
+library(dplyr)
+
+# Ensure joined_data has unique MARKET_KEY values
+joined_data_unique <- joined_data %>%
+  distinct(MARKET_KEY, .keep_all = TRUE)
+
+# Perform a left join to add Region to sdf
+merged_data <- sdf %>%
+  left_join(joined_data_unique[, c("MARKET_KEY", "Region")], by = "MARKET_KEY")
+
+
+```
+
+## Calculate the average price for each market key
+
+```{r}
+# Calculate the average price for each market key
+avg_price_by_market <- sdf %>%
+  group_by(MARKET_KEY) %>%
+  summarize(Avg_Price = mean(AVG_PRICE, na.rm = TRUE))
+
+# Display the table
+print(avg_price_by_market)
+
+
+```
+
+## Top 10
+
+```{r}
+# Calculate the average price for each market key and get the top 10
+top_avg_price_by_market <- sdf %>%
+  group_by(MARKET_KEY) %>%
+  summarize(Avg_Price = mean(AVG_PRICE, na.rm = TRUE)) %>%
+  arrange(desc(Avg_Price)) %>%
+  slice_head(n = 10) 
+
+# Display the table of top 10
+print(top_avg_price_by_market)
+
+# Create a plot of average price for the top 10 market keys
+ggplot(top_avg_price_by_market, aes(x = reorder(MARKET_KEY, Avg_Price), y = Avg_Price)) +
+  geom_col() +
+  theme_minimal() +
+  labs(x = "Market Key", y = "Average Price", title = "Top 10 Market Keys by Average Price") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) 
+
+
+```
+Not much variation in price by market key
+
+## Average Price By Region
+
+```{r}
+avg_price_per_region <- merged_data %>%
+  group_by(Region) %>%
+  summarise(Total_Dollar_Sales = sum(DOLLAR_SALES, na.rm = TRUE),
+            Total_Unit_Sales = sum(UNIT_SALES, na.rm = TRUE),
+            Avg_Price = Total_Dollar_Sales / Total_Unit_Sales)
+
+print(avg_price_per_region)
+
+# Plot the average price per region
+ggplot(avg_price_per_region, aes(x = reorder(Region, -Avg_Price), y = Avg_Price)) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  theme_minimal() +
+  labs(x = "Region", y = "Average Price", title = "Average Price by Region") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+```
+
+Average price was highest in the Northern region. 
+
+
+## Formatting date for time series graphs
+
+```{r}
+
+merged_2 <- merged_data
+
+merged_2$DATE <- as.Date(merged_2$DATE, format = "%Y-%m-%d")
+
+str(merged_2)
+
+
+```
+
+
+## Time series graphs
+```{r}
+
+library(scales) 
+sales_by_region_time <- merged_2 %>%
+  group_by(Region, DATE) %>%
+  summarise(Total_Dollar_Sales = sum(DOLLAR_SALES, na.rm = TRUE)) %>%
+  arrange(Region, DATE)
+
+ggplot(sales_by_region_time, aes(x = DATE, y = Total_Dollar_Sales, group = Region, color = Region)) +
+  geom_line() +
+  labs(title = "Sales Over Time by Region",
+       x = "Date",
+       y = "Total Dollar Sales") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1") +
+  scale_y_continuous(labels = label_comma())
+  theme(legend.title = element_blank())
+
+sales_by_region_time <- merged_2 %>%
+  filter(Region != "Western") %>%
+  group_by(Region, DATE) %>%
+  summarise(Total_Dollar_Sales = sum(DOLLAR_SALES, na.rm = TRUE)) %>%
+  arrange(Region, DATE)
+
+ggplot(sales_by_region_time, aes(x = DATE, y = Total_Dollar_Sales, group = Region, color = Region)) +
+  geom_line() +
+  labs(title = "Sales Over Time by Region",
+       x = "Date",
+       y = "Total Dollar Sales") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1") +
+  scale_y_continuous(labels = label_comma())
+  theme(legend.title = element_blank())
+
+
+```
+Even though the southwest has almost double the population, the region sales for that area are not proportionally higher than the northern region, suggesting the northern customers may be more valuable. We can further that assessment using the above graph, showing that average price is also higher in the Northern region. 
+
+## Caloric Segments by Region
+```{r}
+caloric_segment_count <- merged_2 %>%
+  group_by(Region, CALORIC_SEGMENT) %>%
+  summarise(Count = n(), .groups = 'drop')
+
+# Check the counts
+print(caloric_segment_count)
+
+# Create a bar plot for count of Caloric_Segment by Region
+ggplot(caloric_segment_count, aes(x = Region, y = Count, fill = CALORIC_SEGMENT)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  labs(title = "Count of Caloric Segment by Region",
+       x = "Region",
+       y = "Count") +
+  scale_fill_brewer(palette = "Set1") +
+  theme_minimal() +
+  theme(legend.title = element_blank())
+
+
+```
+
+# Modeling Question 6
+
+- Item Description: Diet Energy Moonlit Casava 2L Multi Jug
+- Caloric Segment: Diet
+- Category: Energy
+- Manufacturer: Swire-CC
+- Brand: Diet Moonlit
+- Package Type: 2L Multi Jug
+- Flavor: ‘Cassava’
+- Question: Swire plans to release this product for 6 months. What will the forecasted demand be, in weeks, for this product?
+
+
+```{r}
+
+merged_3 <- merged_2 # merged_2 <- read.csv("merged_2.csv") # from above
+
+# Step 1: Preprocess the data
+# Convert DATE to a Date type and extract useful features
+merged_3$DATE <- as.Date(merged_3$DATE)
+merged_3$YEAR <- year(merged_3$DATE)
+#merged_3$month <- month(merged_3$DATE)
+#merged_3$day <- day(merged_3$DATE)
+merged_3$WEEK <- week(merged_3$DATE)
+
+```
+
+## Methodology and Filtering
+
+To begin, we explored numerous methodologies to answer this question. A significant amount of our time was dedicated to machine learning models, which were largely incapable of producing a prediction due to data constraints related to the product in question. Consequently, we opted for the ARIMA method. However, we encountered several limitations with this approach as well. Below is our best attempt to navigate these issues, leveraging the available data and making informed assumptions.
+
+```{r}
+
+multi <- merged_3 |> 
+  filter(PACKAGE == "2L MULTI JUG")
+
+small <- merged_3 |> 
+  filter(PACKAGE == "16SMALL MULTI CUP")
+
+sum(small$UNIT_SALES)/sum(multi$UNIT_SALES)
+
+
+first_appearance <- merged_3 %>%
+  filter(CATEGORY == "ENERGY",
+         MANUFACTURER == "SWIRE-CC") %>%
+  group_by(ITEM, MANUFACTURER) %>%
+  summarize(first_appearance_date = min(DATE),
+            last_appearnace = max(DATE))
+
+print(first_appearance)
+
+
+
+x <- merged_3 |> 
+      filter(CATEGORY == "ENERGY") |>
+      group_by(MANUFACTURER, PACKAGE) |>
+      summarise(totalUnits = sum(UNIT_SALES))
+
+print(x, n = 50)
+
+
+```
+
+For the energy drink, we had to make certain concessions in our demand modeling. There were no historical observations of energy drinks matching the size or flavor that Swire wants to introduce, and given Swire's limited history with energy drinks, utilizing data from other manufacturers appeared inadvisable. The primary rationale was Swire's guidance that overestimation is far more costly than underestimation, and other, more established manufacturers have significantly higher demand levels. Additionally, for this, we needed to standardize demand based on package size. Our exploration into Swire's sales data for energy drinks revealed that 99% of all sales were attributable to one size: the 16SMALL MULTI CUP. Hence, we examined all market data to compare sales of the 2L Multi Jug against the 16S Multi and deduced that, on average, 1.7 cups are sold for every Jug. Consequently, we adjusted our final projection based on this ratio.
+
+```{r}
+
+# Filter data for products matching specific criteria
+similar_products <- merged_3 %>%
+  filter(CALORIC_SEGMENT == "DIET/LIGHT", 
+         CATEGORY == "ENERGY", 
+         PACKAGE == "16SMALL MULTI CUP",
+         MANUFACTURER == "SWIRE-CC") %>%
+  filter(UNIT_SALES > 0)
+
+```
+
+## ARIMA Model Development
+
+```{r}
+# Aggregate weekly sales data of similar products
+weekly_sales <- similar_products %>%
+  group_by(YEAR, WEEK, ITEM) %>%
+  summarize(total_unit_sales = sum(UNIT_SALES))
+
+weekly_sales <- weekly_sales %>%
+  group_by(YEAR, WEEK) %>%
+  summarize(total_unit_sales = mean(total_unit_sales)) %>%
+  filter(YEAR < 2022)
+
+
+# arima
+sales_ts <- ts(weekly_sales$total_unit_sales, frequency=52, start=c(2021, which(weekdays(as.Date("2020-12-05")) == "Saturday")))
+
+
+launch_period <- ifelse(time(sales_ts) >= 2021 & time(sales_ts) < 2021.5, 1, 0) 
+
+# Include the intervention in the ARIMA model using the xreg argument
+fit <- auto.arima(sales_ts, xreg = launch_period, seasonal = TRUE, D = 1, max.P = 2, max.Q = 2, max.order = 5, stepwise = FALSE, approximation = FALSE)
+
+#launch period effect only impacts the first 26 weeks
+future_launch_period <- rep(0, 26) # No launch effect in the future
+
+# Forecast with the future values of the launch period
+forecasted_sales <- forecast(fit, xreg = future_launch_period, h=26)
+
+## ***
+# Fit an ARIMA model
+#fit <- auto.arima(sales_ts)
+# Forecast the next 26 weeks (6 months)
+#forecasted_sales <- forecast(fit, h=26)
+## ***
+```
+
+
+## Plots
+```{r}
+# forecast plot
+plot(forecasted_sales)
+
+# Forecast values mean
+print(forecasted_sales$mean)
+
+# values & CI
+print(forecasted_sales)
+
+# Calculate in-sample fitted values
+fitted_values <- fitted(fit)
+
+# Calculate residuals 
+residuals <- sales_ts - fitted_values
+
+# Calculate RMSE
+rmse <- sqrt(mean(residuals^2, na.rm = TRUE))
+print(paste("RMSE:", rmse))
+
+
+# Total Sum of Squares
+tss <- sum((sales_ts - mean(sales_ts))^2)
+
+# Sum of Squares of Residuals
+rss <- sum(residuals^2)
+
+# R-squared
+rsq <- 1 - (rss / tss)
+print(paste("R-squared:", rsq))
+
+adjust1 <- sum(forecasted_sales$mean) / 1.7
+
+adjust2 <- adjust1*1.081
+
+adjust3 <- adjust2*1.081
+  
+predicted_demand <- round(adjust3,0)
+
+print(paste("Predicted Demand For 6 Months:",predicted_demand))
+```
